@@ -125,6 +125,7 @@ class Layout:
     num_hidden_layers: int
     mtp_layers: tuple[int, ...]
     int4_layers: tuple[int, ...]   # routed experts 走 INT4 的层
+    fp8_block_size: tuple[int, int] = (128, 128)
 
 
 def load_layout(input_dir: str, mtp_int4: bool) -> Layout:
@@ -142,7 +143,13 @@ def load_layout(input_dir: str, mtp_int4: bool) -> Layout:
         raise ValueError("config.json 中没有 sparse (MoE) 层")
     if mtp_int4 and not mtp:
         raise ValueError("--mtp-int4 但 config.json 的 num_nextn_predict_layers=0")
-    return Layout(num_hidden, mtp, sparse + (mtp if mtp_int4 else ()))
+    qcfg = cfg.get("quantization_config") or text.get("quantization_config") or {}
+    wbs = qcfg.get("weight_block_size")
+    if isinstance(wbs, (list, tuple)) and len(wbs) == 2:
+        fp8_block_size = (int(wbs[0]), int(wbs[1]))
+    else:
+        fp8_block_size = (128, 128)
+    return Layout(num_hidden, mtp, sparse + (mtp if mtp_int4 else ()), fp8_block_size)
 
 
 # --------------------------------------------------------------------------- #
@@ -354,11 +361,24 @@ def self_check_pack() -> None:
 # 反量化 / 量化
 # --------------------------------------------------------------------------- #
 
-def dequant_fp8_blockwise(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """FP8 blockwise (N,K) + scale (ceil(N/b), ceil(K/b)) -> fp32 (N,K); 兼容非整除尾块。"""
+def dequant_fp8_blockwise(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: tuple[int, int] = (128, 128),
+) -> torch.Tensor:
+    """FP8 blockwise (N,K) + scale (ceil(N/rb), ceil(K/cb)) -> fp32 (N,K); 兼容非整除尾块。"""
+    rb, cb = int(block_size[0]), int(block_size[1])
     s_rows, s_cols = scale.shape
     n, k = weight.shape
-    rb, cb = -(-n // s_rows), -(-k // s_cols)
+    expected_rows, expected_cols = (n + rb - 1) // rb, (k + cb - 1) // cb
+    if (s_rows, s_cols) != (expected_rows, expected_cols):
+        if s_rows > 0 and s_cols > 0 and n % s_rows == 0 and k % s_cols == 0:
+            rb, cb = n // s_rows, k // s_cols
+        else:
+            raise ValueError(
+                f"FP8 blockwise scale shape {tuple(scale.shape)} does not match "
+                f"weight shape {tuple(weight.shape)} with block_size={block_size}"
+            )
     s = scale.float().repeat_interleave(rb, 0)[:n].repeat_interleave(cb, 1)[:, :k]
     return weight.float() * s
 
@@ -408,7 +428,7 @@ def convert_one_file(
 
         if kind == "keep":
             if scale_inv is not None:   # FP8 源里非量化目标 (理论上只有 kv_b_proj 等) -> BF16
-                out[name] = dequant_fp8_blockwise(tensor.to(device), scale_inv.to(device)).bfloat16().cpu()
+                out[name] = dequant_fp8_blockwise(tensor.to(device), scale_inv.to(device), layout.fp8_block_size).bfloat16().cpu()
                 stats["fp8_to_bf16"] += 1
             else:
                 out[name] = tensor
@@ -416,7 +436,7 @@ def convert_one_file(
             continue
 
         w = tensor.to(device)
-        w = dequant_fp8_blockwise(w, scale_inv.to(device)) if scale_inv is not None else w.float()
+        w = dequant_fp8_blockwise(w, scale_inv.to(device), layout.fp8_block_size) if scale_inv is not None else w.float()
         if kind == "int4":
             packed, shape, scale = quantize_int4_channelwise_packed(w)
             out[f"{prefix}.weight_packed"] = packed.cpu()
